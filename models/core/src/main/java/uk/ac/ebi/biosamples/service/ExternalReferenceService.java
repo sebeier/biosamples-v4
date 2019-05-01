@@ -10,7 +10,7 @@ import uk.ac.ebi.biosamples.model.ExternalReference;
 
 @Service
 public class ExternalReferenceService {
-	
+
 	public String getNickname(ExternalReference externalReference) {
 		//TODO make this more configurable
 		if (externalReference.getUrl().contains("www.ebi.ac.uk/ena")) {
@@ -23,7 +23,7 @@ public class ExternalReferenceService {
 			return "dbGaP";
 		} else if (externalReference.getUrl().contains("ega-archive.org/datasets")) {
 			return "EGA Dataset";
-		}  else if (externalReference.getUrl().contains("ega-archive.org/metadata")) {
+		} else if (externalReference.getUrl().contains("ega-archive.org/metadata")) {
 			return "EGA Sample";
 		} else {
 			return "other";
@@ -31,8 +31,8 @@ public class ExternalReferenceService {
 	}
 
 	public Optional<String> getDataId(ExternalReference externalReference) {
-		
-		String nickname = getNickname(externalReference);		
+
+		String nickname = getNickname(externalReference);
 		if ("ENA".equals(nickname) || "ArrayExpress".equals(nickname) || "hPSCreg".equals(nickname)
 				|| "EGA Dataset".equals(nickname) || "EGA Sample".equals(nickname)) {
 			UriComponents uriComponents = UriComponentsBuilder.fromHttpUrl(externalReference.getUrl()).build();

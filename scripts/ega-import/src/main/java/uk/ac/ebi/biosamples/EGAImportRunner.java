@@ -2,6 +2,8 @@ package uk.ac.ebi.biosamples;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.commons.csv.CSVFormat;
+import org.apache.commons.csv.CSVRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -16,7 +18,7 @@ import uk.ac.ebi.biosamples.model.Sample;
 import uk.ac.ebi.biosamples.ols.OlsProcessor;
 import uk.ac.ebi.biosamples.ols.OlsResult;
 
-import java.io.BufferedReader;
+import java.io.FileNotFoundException;
 import java.io.FileReader;
 import java.io.IOException;
 import java.time.Instant;
@@ -37,12 +39,14 @@ public class EGAImportRunner implements ApplicationRunner {
     private final Attribute organism;
     private final BioSamplesClient bioSamplesClient;
     private final OlsProcessor olsProcessor;
+    private final Map<String, Optional<OlsResult>> olsResultCache;
 
     @Autowired
     public EGAImportRunner(BioSamplesClient bioSamplesClient, OlsProcessor olsProcessor) {
         this.bioSamplesClient = bioSamplesClient;
         this.olsProcessor = olsProcessor;
 
+        olsResultCache = new HashMap<>();
         organism = Attribute.build("organism", "Homo sapiens", "http://purl.obolibrary.org/obo/NCBITaxon_9606", null);
     }
 
@@ -54,33 +58,38 @@ public class EGAImportRunner implements ApplicationRunner {
         }
 
         final String dataFolderUrl = args.getSourceArgs()[0];
-        final String datasetDuoUrl = dataFolderUrl + "datasets_duo.csv";
-        final String sampleDataUrl = dataFolderUrl + "sanger_released_samples.csv";
+        final String datasetDuoUrl = dataFolderUrl + "1.datasets_duo.csv";
+        final String sampleDataUrl = dataFolderUrl + "1.2.sanger_released_samples.csv";
         final String phenotypeIriFile = dataFolderUrl + "sanger_datasets_public_phenotype_hpo.csv";
 
         Map<String, SortedSet<String>> datasetToDuoCodesMap = loadDuoCodeMap(datasetDuoUrl);
 //        Map<String, List<OlsResult>> phenotypeIriMap = loadPhenotypeIriMap(phenotypeIriFile);
         Map<String, List<OlsResult>> phenotypeIriMap = new HashMap<>();//todo remove this and uncomment above
 
-        try (BufferedReader br = new BufferedReader(new FileReader(sampleDataUrl))) {
-            String line = br.readLine(); //ignore header
-            LOG.info("Reading file: {}, headers: {}", sampleDataUrl, line);
-            while ((line = br.readLine()) != null && !line.isEmpty()) {
-                String[] sampleValues = line.split(",");
-                String accession = sampleValues[0];
-                String egaId = sampleValues[1];
-                String datasetId = sampleValues[2];
-                String phenotype = sampleValues[3];
-                String sex = sampleValues[4];
+        try {
+            String[] headers = {"biosample_id", "sample_id", "dataset_id", "phenotype", "gender"};
+            FileReader in = new FileReader(sampleDataUrl);
+            Iterable<CSVRecord> records = CSVFormat.DEFAULT
+                    .withHeader(headers)
+                    .withFirstRecordAsHeader()
+                    .parse(in);
+            for (CSVRecord record : records) {
+                String accession = record.get("biosample_id");
+                String egaId = record.get("sample_id");
+                String datasetId = record.get("dataset_id");
+                String phenotype = record.get("phenotype");
+                String sex = record.get("sex");
+                //String sex = "unknown";
+
                 SortedSet<String> duoCodes = datasetToDuoCodesMap.get(datasetId);
                 List<OlsResult> phenotypeIris = phenotypeIriMap.get(phenotype);
 
                 processSampleRecord(accession, egaId, datasetId, phenotype, sex, duoCodes, phenotypeIris);
             }
-        } catch (JsonProcessingException e) {
-            LOG.error("JSON conversion failure", e);
-        } catch (IOException e) {
+        } catch (FileNotFoundException e) {
             LOG.error("Couldn't read file: " + datasetDuoUrl, e);
+        } catch (IOException e) {
+            LOG.error("Failed to parse the file: " + datasetDuoUrl, e);
         }
     }
 
@@ -94,7 +103,7 @@ public class EGAImportRunner implements ApplicationRunner {
             Sample sample = sampleResource.get().getContent();
             LOG.info("Original sample: {}", jsonMapper.writeValueAsString(sample));
             if (sample.getAttributes().size() != 2) {
-                LOG.warn("Attributes size != 2, Attributes {}", sample.getAttributes());
+                LOG.warn("{}: Attributes size != 2, Attributes {}", sample.getAccession(), sample.getAttributes());
             }
 
             //remove extra attributes from migration (deleted and other-migrated from....)
@@ -106,26 +115,26 @@ public class EGAImportRunner implements ApplicationRunner {
                     .addAttribute(organism)
                     .addExternalReference(ExternalReference.build(EGA_DATASET_BASE_URL + datasetId, duoCodes))
                     .addExternalReference(ExternalReference.build(EGA_SAMPLE_BASE_URL + egaId))
-                    .withRelease(Instant.now());
+//                    .withRelease(Instant.now());
+                    .withRelease(Instant.parse("2019-04-01T00:00:01Z"));
 
             //ignore unknown, n/a terms
-            if (UNKNOWN_TERMS.contains(phenotype.toLowerCase())) {
+            if (phenotype == null || "".equals(phenotype) || UNKNOWN_TERMS.contains(phenotype.toLowerCase())) {
                 LOG.info("Ignoring phenotype as it contains {}", phenotype);
             } else {
                 Attribute attributePhenotype = populateAttribute(phenotype, phenotypeIris, ATTRIBUTE_PHENOTYPE);
                 sampleBuilder.addAttribute(attributePhenotype);
             }
-            if (UNKNOWN_TERMS.contains(sex.toLowerCase())) {
+            if (sex == null || "".equals(sex) || UNKNOWN_TERMS.contains(sex.toLowerCase())) {
                 LOG.info("Ignoring sex as it contains {}", sex);
             } else {
-                Attribute attributeSex = populateAttribute(sex, getSexOntology(sex), ATTRIBUTE_SEX);
+                Attribute attributeSex = populateAttribute(sex.toLowerCase(), getSexOntology(sex), ATTRIBUTE_SEX);
                 sampleBuilder.addAttribute(attributeSex);
             }
 
             Sample updatedSample = sampleBuilder.build();
-
-            LOG.info("Updated sample: {}", jsonMapper.writeValueAsString(updatedSample));
             bioSamplesClient.persistSampleResource(updatedSample);
+            LOG.info("Updated sample: {}", jsonMapper.writeValueAsString(updatedSample));
         } else {
             LOG.warn("Sample not found in biosamples: {}", accession);
         }
@@ -134,36 +143,45 @@ public class EGAImportRunner implements ApplicationRunner {
     private Map<String, SortedSet<String>> loadDuoCodeMap(String datasetDuoUrl) {
         Map<String, SortedSet<String>> datasetToDuoCodesMap = new HashMap<>();
 
-        try (BufferedReader br = new BufferedReader(new FileReader(datasetDuoUrl))) {
-            String line = br.readLine(); //ignore header
-            LOG.info("Reading file: {}, headers: {}", datasetDuoUrl, line);
-            while ((line = br.readLine()) != null && !line.isEmpty()) {
-                String[] record = line.replaceAll("[\"\\[\\] ]", "").split(",");
-                String datasetId = record[0];
-                String[] duoCodes = Arrays.copyOfRange(record, 1, record.length);
+        try {
+            String[] headers = {"dataset_id", "duo_codes_json"};
+            FileReader in = new FileReader(datasetDuoUrl);
+            Iterable<CSVRecord> records = CSVFormat.DEFAULT
+                    .withHeader(headers)
+                    .withFirstRecordAsHeader()
+                    .parse(in);
+            for (CSVRecord record : records) {
+                String datasetId = record.get("dataset_id");
+                String duoCodesArrayAsString = record.get("duo_codes_json");
+                String[] duoCodes = duoCodesArrayAsString.replaceAll("[\"\\[\\] ]", "").split(",");
 
                 datasetToDuoCodesMap.put(datasetId,
                         new TreeSet<>(Arrays.stream(duoCodes).map(s -> "DUO:" + s).collect(Collectors.toList())));
             }
-
+        } catch (FileNotFoundException e) {
+            LOG.error("couldn't read file: " + datasetToDuoCodesMap, e);
         } catch (IOException e) {
-            LOG.error("couldn't read file: " + datasetDuoUrl, e);
+            LOG.error("Failed to parse the file: " + datasetToDuoCodesMap, e);
         }
+
         return datasetToDuoCodesMap;
     }
 
     private Map<String, List<OlsResult>> loadPhenotypeIriMap(String phenotypeIriFile) {
         Map<String, List<OlsResult>> phenotypeIriMap = new HashMap<>();
 
-        try (BufferedReader br = new BufferedReader(new FileReader(phenotypeIriFile))) {
-            String line = br.readLine(); //ignore header
-            LOG.info("Reading file: {}, headers: {}", phenotypeIriFile, line);
-            while ((line = br.readLine()) != null && !line.isEmpty()) {
-                String[] record = line.split(",", -1);
-                String publicPhenotype = record[0];
-                String mappedPhenotype = record[1];
-                String hpoId = record[2];
-                String efoId = record[3];
+        try {
+            String[] headers = {"public_phenotype", "mapped_term", "hpo_id", "efo_id"};
+            FileReader in = new FileReader(phenotypeIriFile);
+            Iterable<CSVRecord> records = CSVFormat.DEFAULT
+                    .withHeader(headers)
+                    .withFirstRecordAsHeader()
+                    .parse(in);
+            for (CSVRecord record : records) {
+                String publicPhenotype = record.get("public_phenotype");
+                String mappedPhenotype = record.get("mapped_term");
+                String hpoId = record.get("hpo_id");
+                String efoId = record.get("efo_id");
                 List<OlsResult> iriSet = new ArrayList<>();
 
                 if (hpoId != null && !"".equals(hpoId)) {
@@ -177,10 +195,12 @@ public class EGAImportRunner implements ApplicationRunner {
 
                 phenotypeIriMap.put(publicPhenotype, iriSet);
             }
-
-        } catch (IOException e) {
+        } catch (FileNotFoundException e) {
             LOG.error("couldn't read file: " + phenotypeIriFile, e);
+        } catch (IOException e) {
+            LOG.error("Failed to parse the file: " + phenotypeIriFile, e);
         }
+
         return phenotypeIriMap;
     }
 
@@ -200,7 +220,7 @@ public class EGAImportRunner implements ApplicationRunner {
             } else if (attribute.getType().equals("sex")) {
                 attributesToRemove.add(attribute);
                 LOG.warn("Removing attribute sex={} from original sample: {}", attribute.getValue(), sample.getAccession());
-            }
+            }//todo ega dataset and sample.
         }
         for (Attribute attribute : attributesToRemove) {
             sample.getAttributes().remove(attribute);
@@ -231,7 +251,12 @@ public class EGAImportRunner implements ApplicationRunner {
     private Optional<OlsResult> getOlsMappedTerm(String termToMap) {
         Optional<OlsResult> olsMappedTerm = Optional.empty();
         if (termToMap.matches("^[A-Za-z]+[_:\\-][0-9]+$")) {
-            olsMappedTerm = olsProcessor.queryForOlsObject(termToMap);
+            if (olsResultCache.containsKey(termToMap)) {
+                olsMappedTerm = olsResultCache.get(termToMap);
+            } else {
+                olsMappedTerm = olsProcessor.queryForOlsObject(termToMap);
+                olsResultCache.put(termToMap, olsMappedTerm);
+            }
 
             if (olsMappedTerm.isPresent()) {
                 LOG.info("OLS mapped term {} into {}", termToMap, olsMappedTerm.get().getIri());
@@ -245,7 +270,7 @@ public class EGAImportRunner implements ApplicationRunner {
 
     private List<OlsResult> getSexOntology(String sex) {
         List<OlsResult> olsResults;
-        switch(sex.toLowerCase()) {
+        switch (sex.toLowerCase()) {
             case "male":
                 olsResults = Collections.singletonList(new OlsResult("male", "http://purl.obolibrary.org/obo/PATO_0000384"));
                 break;
